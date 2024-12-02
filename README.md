@@ -700,3 +700,238 @@ def load_dataset_from_minio(dataset : Literal["mnist, fashion_mnist, svhn, cifar
 
     return dataset
 ```
+
+### 7. 블록 유효성 검증
+
+tensor shape에 따라 여러 제약 사항이 있기 때문에 이를 프론트 단에서 한 번, python code로 변환하는 부분에서 한 번 유효성 검증을 해주는 것으로 정했다. 특히 `in_channel` 과 `out_channel`을 맞추는 것에 집중했는데 layer 통과 후 shape 변화를 수학적으로 수식을 작성해주는 식으로 코드를 짰다. 해당 함수를 재귀적으로 리턴해줘서 레이어 개수에 상관없이 레이어를 순차적으로 진행할 수 있도록 했다.
+또한, 데이터 셋에 따라 최종 결정 label의 개수가 달라지기 때문에 이 또한 검증 내역에 포함시켰다. 예를 들어 MNIST 데이터를 선택하면 마지막에 Linear 레이어의 `out_channel`이 10 이고, EMNIST 일 경우 26이어야 한다.
+
+```typescript
+// 블록 유효성 검사 함수
+const validateBlock = (
+  input: tensorShape | undefined,
+  block: BlockDefinition
+) => {
+  if (input === undefined) return undefined;
+  var out_channels: number = input.channels;
+
+  // 파라미터 검증
+  const hasEmptyParams = block.params.some((param) => {
+    if (param.value === undefined) {
+      toast.error(
+        `${block.name} 블록의 ${param.name} 파라미터에 빈칸이 있습니다.`
+      );
+      return true;
+    }
+    return false;
+  });
+
+  if (hasEmptyParams) return undefined;
+
+  if (block.name === "nn.Conv2d") {
+    const in_channels = block.params[0].value;
+
+    if (input.channels != in_channels) {
+      toast.error(
+        `Conv2d의 input_channel : ${in_channels} 과 이전 레이어의 output_channel : ${input.channels}이 맞지 않습니다.`
+      );
+      return undefined;
+    }
+
+    if (block.params[1].value) {
+      out_channels = block.params[1].value;
+    }
+    const kernel_size = block.params[2].value;
+
+    if (kernel_size === undefined) return undefined;
+
+    if (kernel_size >= input.width || kernel_size >= input.height) {
+      toast.error(
+        `Conv2d의 kernel_size : ${kernel_size}이 input data size : ${input.width} * ${input.height} 보다 큽니다.`
+      );
+      return undefined;
+    }
+
+    if (
+      block.params[0].value &&
+      block.params[1].value &&
+      block.params[0].value * block.params[1].value < 3
+    ) {
+      toast.error(
+        `원활한 레이어 분석을 위해 in_channels 와 out_channels의 곱이 3 이상이 되게 해주세요.`
+      );
+      return undefined;
+    }
+
+    return {
+      channels: out_channels,
+      height: Math.floor(input.height - (kernel_size - 1) - 1 + 1),
+      width: Math.floor(input.width - (kernel_size - 1) - 1 + 1),
+    };
+  }
+  if (block.name === "nn.ConvTranspose2d") {
+    const in_channels = block.params[0].value;
+
+    if (input.channels != in_channels) {
+      toast.error(
+        `ConvTranspose2d의 input_channel : ${in_channels} 과 이전 레이어의 output_channel : ${input.channels}이 맞지 않습니다.`
+      );
+      return undefined;
+    }
+    if (block.params[1].value) {
+      out_channels = block.params[1].value;
+    }
+    const kernel_size = block.params[2].value;
+
+    if (kernel_size === undefined) return undefined;
+
+    if (kernel_size >= input.width || kernel_size >= input.height) {
+      toast.error(
+        `ConvTranspose2d의 kernel_size : ${kernel_size}이 input data size : ${input.width} * ${input.height} 보다 큽니다.`
+      );
+      return undefined;
+    }
+
+    return {
+      channels: out_channels,
+      height: input.height - 1 + kernel_size - 1 + 1,
+      width: input.width - 1 + kernel_size - 1 + 1,
+    };
+  }
+  if (["MaxPool2d", "AvgPool2d"].includes(block.name)) {
+    const kernel_size = block.params[0].value;
+    const stride = block.params[1].value;
+    const constant = block.name === "MaxPool2d" ? 1 : 0;
+
+    if (kernel_size === undefined) return undefined;
+
+    if (kernel_size >= input.width || kernel_size >= input.height) {
+      toast.error(
+        `${block.name}의 kernel_size : ${kernel_size}이 input data size : ${input.width} * ${input.height} 보다 큽니다.`
+      );
+      return undefined;
+    }
+
+    if (stride === undefined) return undefined;
+
+    if (stride >= input.width || stride >= input.height) {
+      toast.error(
+        `${block.name}의 stride : ${stride}이 input data size : ${input.width} * ${input.height} 보다 큽니다.`
+      );
+    }
+
+    return {
+      channels: out_channels,
+      height: Math.floor(
+        (input.height - (kernel_size - constant) - constant) / stride + 1
+      ),
+      width: Math.floor(
+        (input.width - (kernel_size - constant) - constant) / stride + 1
+      ),
+    };
+  }
+  if (
+    [
+      "ReflectionPad2d",
+      "ReplicationPad2d",
+      "ZeroPad2d",
+      "ConstantPad2d",
+    ].includes(block.name)
+  ) {
+    const padding = block.params[0].value;
+    if (padding === undefined) return undefined;
+
+    return {
+      channels: out_channels,
+      height: input.height + padding + padding,
+      width: input.width + padding + padding,
+    };
+  }
+  if (block.name === "Linear") {
+    const in_channels = block.params[0].value;
+
+    if (input.channels * input.height * input.width != in_channels) {
+      toast.error(
+        `${
+          block.name
+        }의 input_channel : ${in_channels} 과 이전 레이어의 output_channel : ${
+          input.channels * input.height * input.width
+        }이 맞지 않습니다.`
+      );
+      return undefined;
+    }
+    if (block.params[1].value) {
+      out_channels = block.params[1].value;
+    }
+    return {
+      channels: out_channels,
+      height: 1,
+      width: 1,
+    };
+  }
+  return input;
+};
+```
+
+```typescript
+// Zustand 스토어 정의
+export const useBlockStore = create<BlockState>((set, get) => ({
+  blockList: null,
+
+  setBlockList: (blockList: BlockDefinition[]) => {
+    const updatedBlockList = blockList.map((block) => ({
+      ...block,
+      params: block.params.map((param) => ({
+        ...param,
+        value: param.value,
+      })),
+    }));
+    set({ blockList: updatedBlockList });
+  },
+
+  blockListValidation: (dataset: Dataset): boolean => {
+    // input의 channels 와 레이어의 in_channels 를 검사
+    // input의 width, height와 레이어의 kernel_size 를 검사
+    const blockList = get().blockList;
+    let dataShape: tensorShape | undefined = {
+      channels: datasetChannels[dataset],
+      width: datasetSizes[dataset],
+      height: datasetSizes[dataset],
+    };
+
+    blockList?.forEach((block) => {
+      if (block.name !== "start" && block.name !== "end") {
+        dataShape = validateBlock(dataShape, block);
+      }
+    });
+
+    if (!dataShape) {
+      return false; // validation 실패 시 즉시 false 반환
+    }
+
+    if (dataShape && dataShape.channels !== datasetLabels[dataset]) {
+      toast.error(
+        `마지막 출력은 ${datasetLabels[dataset]} 개의 channel로 이루어져 있어야 합니다.`
+      );
+      return false;
+    }
+    if (dataShape && (dataShape.width != 1 || dataShape.height != 1)) {
+      toast.error(
+        `마지막 출력 전에 width와 height을 1로 만들어 주세요. (힌트: Linear 레이어)`
+      );
+      return false;
+    }
+
+    return true;
+  },
+
+  getLayerData: () => {
+    const blockList = get().blockList;
+    if (!blockList) return [];
+
+    // convertBlocksToApiFormat 함수를 사용하여 변환
+    const { layers } = convertBlocksToApiFormat(blockList);
+    return layers;
+  },
+}));
+```
