@@ -703,7 +703,8 @@ def load_dataset_from_minio(dataset : Literal["mnist, fashion_mnist, svhn, cifar
 
 ### 7. 블록 유효성 검증
 
-tensor shape에 따라 여러 제약 사항이 있기 때문에 이를 프론트 단에서 한 번, python code로 변환하는 부분에서 한 번 유효성 검증을 해주는 것으로 정했다. 특히 `in_channel` 과 `out_channel`을 맞추는 것에 집중했는데 layer 통과 후 shape 변화를 수학적으로 수식을 작성해주는 식으로 코드를 짰다. 해당 함수를 재귀적으로 리턴해줘서 레이어 개수에 상관없이 레이어를 순차적으로 진행할 수 있도록 했다.
+tensor shape에 따라 여러 제약 사항이 있기 때문에 이를 프론트 단에서 한 번, python code로 변환하는 부분에서 한 번 유효성 검증을 해주는 것으로 정했다. 나는 Typescript를 이용한 프론트단에서의 유효성 검증을 맡았다.
+특히 `in_channel` 과 `out_channel`을 맞추는 것에 집중했는데 layer 통과 후 shape 변화를 수학적으로 수식을 작성해주는 식으로 코드를 짰다. 해당 함수를 재귀적으로 리턴해줘서 레이어 개수에 상관없이 레이어를 순차적으로 진행할 수 있도록 했다.
 또한, 데이터 셋에 따라 최종 결정 label의 개수가 달라지기 때문에 이 또한 검증 내역에 포함시켰다. 예를 들어 MNIST 데이터를 선택하면 마지막에 Linear 레이어의 `out_channel`이 10 이고, EMNIST 일 경우 26이어야 한다.
 
 ```typescript
@@ -935,3 +936,85 @@ export const useBlockStore = create<BlockState>((set, get) => ({
   },
 }));
 ```
+
+### 8. Kubernetes
+
+#### Architecture
+
+![alt text](./assets/architecture/architecture.png)
+
+Infra만 담당하는 팀원이 있어서 해당 팀원이 certificate과 같은 초기 세팅 부분을 많이 담당했다. CPU 서버를 마스터 노드로, GPU 서버를 워커 노드로 썼다.
+나는 Kubeflow를 뚝딱 거려 본 경험이 있어 GPU 서버 세팅을 맡았고, Nvidia container toolkit, CuDNN, CUDA 등의 패키지 설치와 함께 FastAPI 컨테이너의 배포를 맡았다.
+
+ML 파이프라인 구성, GPU Utilization, 을 위한 Kubernetes 적용이었지만 EKS 없이 두 EC2 서버를 클러스터로 관리한다는 것이 쉬운 일은 아니었다. 특히 네트워크에 대한 지식이 없지 않은 두 사람이었음에도
+외부(public) IP, 내부(private) IP 에 대한 뭉뜽그려진 이해로 덤비다보니 디버깅이 매우 오래걸렸다. VPN을 이용해 두 노드를 하나의 네트워크 안에 두는 것은 도저히 둘이서는 떠올릴 수 없었을 것이다. 그래도 `coredns`의 dns 시스템과 CIDR 설정 등에 대해 많이 배우는 기회가 되었음에는 틀림없다.
+
+모델의 구조와 같은 JSON 데이터를 어디에 어떻게 저장할 것이냐에 대한 고민을 오래 했고, PostgreSQL의 JSON 타입을 쓸 것인가, MongoDB를 쓸 것인가의 고민부터
+해당 데이터를 GPU 서버에서 관리할 것이냐 CPU 서버에서 관리할 것이냐 등의 고민을 했다. 아키텍처에 대한 경험이 부족했고, 업무 분담을 하다보니 내 파트가 아니게 되어
+팀원들을 충분히 설득하지 못해 흐지부지 되어 mySQL에 JSON 타입으로 저장하게 된 것은 개인적으로 아쉬운 부분이다. 물론 당시에 JSON의 길이가 그렇게 길지 않을 것이라는 점을 고려하여 그렇게 정하긴 했다.
+
+모델의 버전을 관리한다는 점과 모델의 분석결과를 제공한다는 점 등이 혼재되어 model의 학습/테스트 와 분석이 각각 model_train, model_test API 로 분리되었다. (작명이 너무 헷갈리게 되어 있긴 하다.)
+자연히 두 컨테이너에서 모두 접근할 수 있는 모델 저장소가 필요했고 MinIO를 자연스럽게 떠올리게 되었다.
+
+대부분의 요청은 Java와 MySQL 진영을 거쳐 GPU 서버의 FastAPI 진영으로 넘어오지만, 간혹 프론트에서 곧바로 FastAPI에 요청하는 경우가 있는데, 해당 기능이 바로
+
+1. 방금 학습된 모델에 대해 커스텀 데이터 테스트
+2. 유사 모델 검색
+
+기능이다. 내가 구현한 2. 유사 모델 검색의 경우 ChatGPT API 를 사용하고, milvus 벡터 db의 검색 computation 비용이 높기 때문에 Redis를 이용해 캐싱했다. 생각해보면 Redis가 어차피 같은 Pod 안에 있으니 Python 내장 캐싱 기능을 썼어도 됐다.
+
+다음은 우리 클러스터의 k8s resource 들이다.
+
+- Configmap
+
+<p align="center">
+<img src="./assets/kubernetes-resources/Configmap.PNG" style="width:50%" />
+</p>
+
+- Deployment
+
+<p align="center">
+<img src="./assets/kubernetes-resources/Deployments.PNG" style="width:50%" />
+</p>
+
+- Ingress
+
+<p align="center">
+<img src="./assets/kubernetes-resources/Ingress.PNG" style="width:50%" />
+</p>
+
+- Nodes
+
+<p align="center">
+<img src="./assets/kubernetes-resources/Nodes.PNG" style="width:50%" />
+</p>
+
+- Pods
+
+<p align="center">
+<img src="./assets/kubernetes-resources/Pods.PNG" style="width:50%" />
+</p>
+
+- Secret
+
+<p align="center">
+<img src="./assets/kubernetes-resources/Secret.PNG" style="width:50%" />
+</p>
+
+- Service
+
+<p align="center">
+<img src="./assets/kubernetes-resources/Services.PNG" style="width:50%" />
+</p>
+
+## 후기
+
+- 기획부터 내 입김이 많이 들어간 프로젝트가 완성되었고, 운 좋게도 싸피 결선 발표(8팀/141팀)까지 진출하게 되어 좋은 평가를 받았다. 개인적으로 이 프로젝트가 내 MLOps 커리어의 시작이라고 생각한다.
+
+- 처음 시작할 때는 Spring을 이용한 CRUD를 마지막 프로젝트에서 해보고 싶었지만 MLOps 느낌으로 흘러가다 보니 AI와 FastAPI를 맡게 되었다.
+
+- 얻어간게 참 많았다. k8s 네트워킹을 구성한 것도, 실제로 GPU 서버와 k8s로 서비스를 만들어 본 것도 참 어디가서 할 수 없는 경험이라고 생각한다.
+
+- CKA 를 공부해서 직접 구현하고, 이를 서비스화 해서 기능으로 제공한 것도 진짜 뿌듯한 기억이다. 이게 될까에 대한 막연한 불안감이 공부를 하면서 내용을 이해하다 보니 확신으로 점점 바뀌어 갔다.
+
+- 오히려 결과 분석의 이미지 시각화 파트를 진행할 때 시간이 부족해 GPT의 도움을 많이 받았다. 결과적으로 코드를 거의 치지 않았지만, 내용을 완벽하게 이해했고 GPT가 정확한 코드를 바로 뱉어버려서 즉각적으로 채택해서 쓰다보니 그랬긴 하다.
